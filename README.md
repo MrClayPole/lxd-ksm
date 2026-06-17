@@ -1,7 +1,7 @@
 # LXD KSM Enabler
 
-Enable Kernel Same-page Merging (KSM) for LXD virtual machines, recovering
-30-35 GB of RAM on typical multi-VM deployments running identical OS images.
+Enable Kernel Same-page Merging (KSM) for LXD virtual machines to reclaim
+memory on multi-VM deployments running identical OS images.
 
 ## The Problem
 
@@ -111,6 +111,33 @@ done
 - Ubuntu 24.04+ / kernel ≥ 6.8
 - `inotify-tools` package (`inotifywait`)
 - `qemu-system-x86_64` bundled with LXD snap
+
+## Security Considerations
+
+**KSM exposes cross-VM side-channel attacks.** When KSM merges identical
+pages across VMs, a malicious process in one VM can use timing analysis to
+detect whether a particular page is shared — leaking information about the
+other VM's memory state.
+
+- **Rowhammer / RAMBleed** — KSM increases the density of identical pages,
+  amplifying Rowhammer-style bit-flip attacks. An attacker in one VM may
+  flip bits in a page shared with another VM.
+- **KSM side channel** — timing probes against `/sys/kernel/mm/ksm/pages_sharing`
+  or `MADV_UNMERGEABLE` latency can reveal which pages are shared, leaking
+  secrets (keys, passwords, encryption state) across VM boundaries.
+- **LXD's default (`memory-backend-memfd`)** avoids these risks precisely
+  because `MAP_SHARED` prevents KSM. Switching to `memory-backend-ram`
+  with `merge=on` explicitly opts into this threat model.
+
+**Mitigations:**
+- Only enable this on **single-tenant** or **trusted** hosts where all VMs
+  are under your control.
+- Do not co-locate sensitive workloads (e.g. crypto signing, TLS termination)
+  with untrusted VMs on a KSM-enabled host.
+- Consider using `ksm_advisor` (Linux 6.x+ smart scan) to reduce cross-VM
+  page exposure — though this only limits the window, not the risk.
+- If you need tenant isolation, stick with LXD's memfd default and accept
+  the memory overhead.
 
 ## Caveats
 
