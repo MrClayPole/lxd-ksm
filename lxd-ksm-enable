@@ -1,0 +1,38 @@
+#!/bin/bash
+# lxd-ksm-enable: KSM enabler for LXD VMs
+# 1. Sets KSM sysfs tuning
+# 2. Scans all existing qemu.conf files at startup
+# 3. Monitors for new ones via inotify
+# 4. Periodically ensures KSM stays running
+LOGDIR="/var/snap/lxd/common/lxd/logs"
+KSM_SYS="/sys/kernel/mm/ksm"
+
+# Phase 0: tune KSM
+echo 100000 > "$KSM_SYS/pages_to_scan" 2>/dev/null
+echo 500 > "$KSM_SYS/sleep_millisecs" 2>/dev/null
+echo 1 > "$KSM_SYS/use_zero_pages" 2>/dev/null
+echo 1 > "$KSM_SYS/run" 2>/dev/null
+
+# Phase 1: scan existing qemu.conf files (handles boot-time race)
+find "$LOGDIR" -name "qemu.conf" -type f 2>/dev/null | while read fullpath; do
+  sed -i \
+    -e "s/memory-backend-memfd/memory-backend-ram/" \
+    -e "/^share = /d" \
+    -e "/^qom-type = \"memory-backend-ram\"/a merge = \"on\"" \
+    "$fullpath" 2>/dev/null
+done
+
+# Phase 2: watch for new VMs + keep KSM alive
+inotifywait -m -r -e close_write --include "qemu.conf" "$LOGDIR" 2>/dev/null | \
+  while read dir event file; do
+    fullpath="${dir}${file}"
+    if [ -f "$fullpath" ]; then
+      sed -i \
+        -e "s/memory-backend-memfd/memory-backend-ram/" \
+        -e "/^share = /d" \
+        -e "/^qom-type = \"memory-backend-ram\"/a merge = \"on\"" \
+        "$fullpath" 2>/dev/null
+    fi
+    # Re-enable KSM if something stopped it (runs on every event)
+    [ "$(cat "$KSM_SYS/run" 2>/dev/null)" != "1" ] && echo 1 > "$KSM_SYS/run" 2>/dev/null
+  done

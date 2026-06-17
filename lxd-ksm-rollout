@@ -1,0 +1,49 @@
+#!/bin/bash
+# lxd-ksm-rollout: restart each LXD VM one at a time with 2 min boot gaps
+# to apply memory-backend-ram + merge=on for KSM
+set -e
+
+VMS="nova-compute-1 control-node-1 control-node-2 control-node-3 cos-k8s-1 cos-k8s-2 cos-k8s-3 ceph-osd-1 ceph-osd-2 ceph-osd-3 juju3-1"
+
+# Ensure KSM is running
+echo 1 > /sys/kernel/mm/ksm/run
+
+for vm in $VMS; do
+  echo ""
+  echo "====== $vm ======"
+
+  # Stop the VM
+  /snap/bin/lxc stop "$vm" --force 2>/dev/null || true
+  sleep 3
+
+  # Remove stale qemu.conf so LXD regenerates fresh
+  rm -f /var/snap/lxd/common/lxd/logs/$vm/qemu.conf 2>/dev/null
+
+  echo "Starting $vm..."
+  /snap/bin/lxc start "$vm"
+
+  echo "Waiting 2 minutes for $vm to boot..."
+  sleep 120
+
+  # Verify it's running
+  status=$(/snap/bin/lxc info "$vm" 2>/dev/null | grep Status | awk '{print $2}')
+  if [ "$status" != "RUNNING" ]; then
+    echo "WARNING: $vm status is $status, not RUNNING"
+  else
+    echo "✓ $vm is RUNNING"
+  fi
+
+  # Verify qemu.conf was modified
+  if grep -q "memory-backend-ram" /var/snap/lxd/common/lxd/logs/$vm/qemu.conf 2>/dev/null; then
+    echo "✓ qemu.conf modified for $vm"
+  else
+    echo "WARNING: qemu.conf NOT modified for $vm - may need to restart watcher"
+  fi
+done
+
+echo ""
+echo "====== All VMs processed ======"
+echo "Check KSM stats:"
+cat /sys/kernel/mm/ksm/pages_shared
+cat /sys/kernel/mm/ksm/pages_sharing
+cat /sys/kernel/mm/ksm/general_profit

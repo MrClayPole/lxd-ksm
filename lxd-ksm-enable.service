@@ -1,0 +1,19 @@
+[Unit]
+Description=LXD VM KSM enabler - modifies qemu.conf for memory-backend-ram
+After=lxd.service
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/bash -c "echo 100000 > /sys/kernel/mm/ksm/pages_to_scan"
+ExecStartPre=/bin/bash -c "echo 500 > /sys/kernel/mm/ksm/sleep_millisecs"
+ExecStartPre=/bin/bash -c "echo 1 > /sys/kernel/mm/ksm/use_zero_pages"
+ExecStartPre=/bin/bash -c "echo 1 > /sys/kernel/mm/ksm/run"
+ExecStart=/usr/local/bin/lxd-ksm-enable
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
