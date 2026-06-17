@@ -3,7 +3,8 @@
 # to apply memory-backend-ram + merge=on for KSM
 set -e
 
-VMS="nova-compute-1 control-node-1 control-node-2 control-node-3 cos-k8s-1 cos-k8s-2 cos-k8s-3 ceph-osd-1 ceph-osd-2 ceph-osd-3 juju3-1"
+# Change this list to match your VMs in LXD
+VMS="vm1 vm2 vm3"
 
 # Ensure KSM is running
 echo 1 > /sys/kernel/mm/ksm/run
