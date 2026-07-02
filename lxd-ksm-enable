@@ -1,38 +1,128 @@
 #!/bin/bash
 # lxd-ksm-enable: KSM enabler for LXD VMs
-# 1. Sets KSM sysfs tuning
+#
+# 1. Tunes KSM sysfs knobs (uses the kernel 6.7+ advisor when available)
 # 2. Scans all existing qemu.conf files at startup
-# 3. Monitors for new ones via inotify
+# 3. Monitors for new/rewritten qemu.conf files via inotify
 # 4. Periodically ensures KSM stays running
-LOGDIR="/var/snap/lxd/common/lxd/logs"
-KSM_SYS="/sys/kernel/mm/ksm"
+#
+# Changes vs original:
+#   - Strips the vhost-user-fs chardev/device sections from qemu.conf.
+#     Leaving them in place while removing shared memory creates a
+#     half-dead virtiofs device the guest hangs on during boot
+#     (seen as MAAS deployments stalling at "Configure Storage").
+#     With the sections gone the guest cleanly uses the 9p fallback.
+#   - Idempotent: re-running never duplicates merge= lines or rewrites
+#     an already-patched file (also prevents inotify self-retrigger loops).
+#   - Atomic replace via mv (moved_to, not close_write) so our own writes
+#     don't re-trigger the watcher.
+#   - Per-VM opt-out: `lxc config set <vm> user.ksm false` leaves that VM
+#     untouched (keeps memfd + working virtiofs).
+#   - KSM keepalive runs every 60s even when no inotify events arrive.
+#
+# systemd note: order the unit Before=snap.lxd.daemon.service so boot-time
+# VMs are patched before LXD starts QEMU.
 
-# Phase 0: tune KSM
-echo 100000 > "$KSM_SYS/pages_to_scan" 2>/dev/null
-echo 500 > "$KSM_SYS/sleep_millisecs" 2>/dev/null
-echo 1 > "$KSM_SYS/use_zero_pages" 2>/dev/null
-echo 1 > "$KSM_SYS/run" 2>/dev/null
+set -u
+
+LOGDIR="${LOGDIR:-/var/snap/lxd/common/lxd/logs}"
+KSM_SYS="/sys/kernel/mm/ksm"
+LXC_BIN="$(command -v lxc || echo /snap/bin/lxc)"
+
+log() { echo "lxd-ksm: $*"; }
+
+# ---------- Phase 0: tune KSM ----------
+tune_ksm() {
+    echo 1 > "$KSM_SYS/run" 2>/dev/null
+    echo 1 > "$KSM_SYS/use_zero_pages" 2>/dev/null
+    if [ -f "$KSM_SYS/advisor_mode" ]; then
+        # Kernel 6.7+: let the KSM advisor self-tune scan effort
+        echo scan-time > "$KSM_SYS/advisor_mode" 2>/dev/null
+        log "KSM enabled (advisor_mode=scan-time)"
+    else
+        echo 100000 > "$KSM_SYS/pages_to_scan" 2>/dev/null
+        echo 500 > "$KSM_SYS/sleep_millisecs" 2>/dev/null
+        log "KSM enabled (manual tuning)"
+    fi
+}
+
+ksm_keepalive() {
+    [ "$(cat "$KSM_SYS/run" 2>/dev/null)" != "1" ] && \
+        echo 1 > "$KSM_SYS/run" 2>/dev/null && log "re-enabled KSM"
+}
+
+# ---------- patching ----------
+needs_patch() {
+    grep -qE 'memory-backend-memfd|virtio-fs' "$1" 2>/dev/null
+}
+
+opted_out() {
+    # instance name is the directory containing qemu.conf
+    local inst
+    inst="$(basename "$(dirname "$1")")"
+    [ -x "$LXC_BIN" ] || return 1
+    [ "$("$LXC_BIN" config get "$inst" user.ksm 2>/dev/null)" = "false" ]
+}
+
+patch_conf() {
+    local f="$1" tmp
+    needs_patch "$f" || return 0
+    if opted_out "$f"; then
+        log "skipping $f (user.ksm=false)"
+        return 0
+    fi
+
+    tmp="$(mktemp "${f}.XXXXXX")" || return 1
+
+    # Paragraph mode: qemu.conf sections are blank-line separated.
+    #  - drop any section referencing virtio-fs (chardev + vhost-user-fs
+    #    device); the 9p sections don't match and survive untouched
+    #  - memfd -> ram, drop share=, add merge= once
+    awk '
+        BEGIN { RS=""; ORS="\n\n" }
+        /virtio-fs/ { next }
+        {
+            gsub(/memory-backend-memfd/, "memory-backend-ram")
+            gsub(/\nshare = "[^"]*"/, "")
+            if ($0 ~ /qom-type = "memory-backend-ram"/ && $0 !~ /\nmerge = /)
+                sub(/qom-type = "memory-backend-ram"/, \
+                    "qom-type = \"memory-backend-ram\"\nmerge = \"on\"")
+            print
+        }
+    ' "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
+
+    # sanity: never install an empty config
+    if [ -s "$tmp" ]; then
+        chmod --reference="$f" "$tmp" 2>/dev/null
+        mv "$tmp" "$f"
+        log "patched $f"
+    else
+        rm -f "$tmp"
+        log "ERROR: refusing to install empty config for $f"
+        return 1
+    fi
+}
+
+# ---------- main ----------
+tune_ksm
 
 # Phase 1: scan existing qemu.conf files (handles boot-time race)
-find "$LOGDIR" -name "qemu.conf" -type f 2>/dev/null | while read fullpath; do
-  sed -i \
-    -e "s/memory-backend-memfd/memory-backend-ram/" \
-    -e "/^share = /d" \
-    -e "/^qom-type = \"memory-backend-ram\"/a merge = \"on\"" \
-    "$fullpath" 2>/dev/null
+find "$LOGDIR" -name qemu.conf -type f 2>/dev/null | while read -r f; do
+    patch_conf "$f"
 done
 
 # Phase 2: watch for new VMs + keep KSM alive
-inotifywait -m -r -e close_write --include "qemu.conf" "$LOGDIR" 2>/dev/null | \
-  while read dir event file; do
-    fullpath="${dir}${file}"
-    if [ -f "$fullpath" ]; then
-      sed -i \
-        -e "s/memory-backend-memfd/memory-backend-ram/" \
-        -e "/^share = /d" \
-        -e "/^qom-type = \"memory-backend-ram\"/a merge = \"on\"" \
-        "$fullpath" 2>/dev/null
+inotifywait -m -r -q -e close_write -e moved_to --include 'qemu\.conf$' \
+    "$LOGDIR" 2>/dev/null | \
+while true; do
+    if read -r -t 60 dir _event file; then
+        fullpath="${dir}${file}"
+        [ -f "$fullpath" ] && patch_conf "$fullpath"
+    else
+        # read timed out (rc>128) -> periodic housekeeping;
+        # anything else means the pipe closed -> exit
+        rc=$?
+        [ "$rc" -gt 128 ] || { log "inotifywait exited"; break; }
     fi
-    # Re-enable KSM if something stopped it (runs on every event)
-    [ "$(cat "$KSM_SYS/run" 2>/dev/null)" != "1" ] && echo 1 > "$KSM_SYS/run" 2>/dev/null
-  done
+    ksm_keepalive
+done
